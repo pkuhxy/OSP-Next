@@ -170,6 +170,8 @@ class T2VInferencePipeline(DiffusionPipeline):
         seed=None,
         max_sequence_length=512,
         device="cuda:0",
+        return_trace=False,
+        compute_teacher_logprob=True,
     ):
         if negative_prompt is None or negative_prompt == "":
             negative_prompt = NEGATIVE_PROMPT
@@ -212,10 +214,25 @@ class T2VInferencePipeline(DiffusionPipeline):
             "negative_prompt_embeds": negative_prompt_embeds,
         }
 
-        latents = self.scheduler.sample(model=self.predictor, latents=latents, **model_kwargs)
+        sample_output = self.scheduler.sample(
+            model=self.predictor,
+            latents=latents,
+            return_trace=return_trace,
+            compute_teacher_logprob=compute_teacher_logprob,
+            **model_kwargs
+        )
+        denoising_trace = None
+        if return_trace:
+            latents, denoising_trace = sample_output
+        else:
+            latents = sample_output
 
+        denoised_latents = latents
         latents = latents.to(self.vae.dtype)
         video = self.decode_latents(latents)
+        if return_trace:
+            denoising_trace["final_latents"] = denoised_latents.detach().to("cpu").contiguous()
+            return {"videos": video, "denoising_trace": denoising_trace}
         return video
 
 pipeline = {

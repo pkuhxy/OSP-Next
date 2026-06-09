@@ -90,13 +90,25 @@ class FlowMatchingScheduler:
         self,
         model,
         latents,
+        return_trace=False,
+        compute_teacher_logprob=True,
         **model_kwargs,
     ):
         num_inference_steps = self.num_inference_steps
-        sigmas = self._set_sigmas(training=False)
+        image_seq_len = latents.shape[-2] * latents.shape[-1] // 4 if self.use_dynamic_shifting else None
+        sigmas = self._set_sigmas(training=False, image_seq_len=image_seq_len, device=latents.device)
         if safe_get_rank() == 0:
             print(f"sigmas: {sigmas}")
         timesteps = sigmas.clone() * 1000
+        trace = None
+        if return_trace:
+            trace = {
+                "x_T": self._tensor_to_cpu(latents),
+                "sigmas": self._tensor_to_cpu(sigmas),
+                "timesteps": self._tensor_to_cpu(timesteps),
+                "steps": [],
+                "teacher_logprob_mode": "flow_sde_transition" if compute_teacher_logprob else None,
+            }
 
         # for loop denoising to get clean latents
         with tqdm(total=num_inference_steps, desc="Sampling") as progress_bar:
@@ -123,10 +135,73 @@ class FlowMatchingScheduler:
                         )
                     noise_pred = noise_uncond + self.guidance_scale * (noise_pred - noise_uncond)
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self._step(noise_pred, latents, sigmas[i + 1] - sigmas[i])
+                next_latents = self._step(noise_pred, latents, sigmas[i + 1] - sigmas[i])
+                if trace is not None:
+                    teacher_logprob = None
+                    if compute_teacher_logprob:
+                        teacher_logprob = self._teacher_transition_logprob(
+                            sigmas,
+                            noise_pred,
+                            i,
+                            latents,
+                            next_latents,
+                        )
+                    trace["steps"].append(
+                        {
+                            "step_index": i,
+                            "sigma": self._tensor_to_cpu(sigmas[i]),
+                            "sigma_next": self._tensor_to_cpu(sigmas[i + 1]),
+                            "timestep": self._tensor_to_cpu(timesteps[i]),
+                            "x_t": self._tensor_to_cpu(latents),
+                            "x_t_minus_1": self._tensor_to_cpu(next_latents),
+                            "teacher_logprob": self._tensor_to_cpu(teacher_logprob) if teacher_logprob is not None else None,
+                        }
+                    )
+                latents = next_latents
                 progress_bar.update()
         
+        if trace is not None:
+            return latents, trace
         return latents
+
+    def _tensor_to_cpu(self, tensor):
+        return tensor.detach().to("cpu").contiguous()
+
+    def _teacher_transition_logprob(
+        self,
+        sigmas_schedule,
+        model_output,
+        timestep_index,
+        sample,
+        prev_sample,
+    ):
+        model_output = model_output.float()
+        sample = sample.float()
+        prev_sample = prev_sample.float()
+
+        sigma = sigmas_schedule[timestep_index].to(device=sample.device, dtype=torch.float32)
+        sigma_prev = sigmas_schedule[timestep_index + 1].to(device=sample.device, dtype=torch.float32)
+        sigma_max = sigmas_schedule[0].to(device=sample.device, dtype=torch.float32)
+        sigma_min = sigmas_schedule[-1].to(device=sample.device, dtype=torch.float32)
+        dt = sigma_prev - sigma
+
+        sigma_b = sigma.view(1, 1, 1, 1, 1) if sigma.dim() == 0 else sigma.view(-1, 1, 1, 1, 1)
+        dt_b = dt.view(1, 1, 1, 1, 1) if dt.dim() == 0 else dt.view(-1, 1, 1, 1, 1)
+        safe_sigma_b = sigma_b.clamp_min(torch.finfo(torch.float32).eps)
+
+        std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma_b
+        std = std_dev_t * torch.sqrt((-dt_b).clamp_min(torch.finfo(torch.float32).eps))
+        prev_sample_mean = (
+            sample * (1 + std_dev_t ** 2 / (2 * safe_sigma_b) * dt_b)
+            + model_output * (1 + std_dev_t ** 2 * (1 - sigma_b) / (2 * safe_sigma_b)) * dt_b
+        )
+
+        log_prob = (
+            -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std ** 2))
+            - torch.log(std)
+            - 0.5 * math.log(2 * math.pi)
+        )
+        return log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
     def get_latent_model_input(self, latents, **kwargs):
         latent_model_input_cond = latent_model_input_uncond = latents

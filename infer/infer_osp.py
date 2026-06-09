@@ -35,6 +35,87 @@ from ospnext.pipelines import pipelines
 from ospnext.utils.infer_utils import load_prompts, load_images, save_videos, save_video_grid
 from ospnext.utils.random_utils import set_seed
 
+
+def _to_python_value(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return value.item() if value.ndim == 0 else value
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except ValueError:
+            pass
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+
+def _select_reward_for_sample(rewards, sample_idx):
+    if rewards is None:
+        return None
+    if isinstance(rewards, dict):
+        return {key: _select_reward_for_sample(value, sample_idx) for key, value in rewards.items()}
+    if isinstance(rewards, torch.Tensor):
+        return _to_python_value(rewards[sample_idx])
+    if isinstance(rewards, (list, tuple)):
+        return _to_python_value(rewards[sample_idx])
+    return _to_python_value(rewards)
+
+
+def _slice_tensor_batch(tensor, sample_idx):
+    if tensor is None:
+        return None
+    return tensor[sample_idx].detach().cpu().contiguous()
+
+
+def save_denoising_traces(
+    trace,
+    videos,
+    prompts,
+    seed,
+    start_index,
+    output_dir,
+    trace_dir,
+    rewards=None,
+):
+    os.makedirs(trace_dir, exist_ok=True)
+    saved_paths = []
+    for local_idx, prompt in enumerate(prompts):
+        sample_index = start_index + local_idx
+        sample_steps = []
+        for step in trace["steps"]:
+            sample_steps.append(
+                {
+                    "step_index": step["step_index"],
+                    "sigma": _to_python_value(step["sigma"]),
+                    "sigma_next": _to_python_value(step["sigma_next"]),
+                    "timestep": _to_python_value(step["timestep"]),
+                    "x_t": _slice_tensor_batch(step["x_t"], local_idx),
+                    "x_t_minus_1": _slice_tensor_batch(step["x_t_minus_1"], local_idx),
+                    "teacher_logprob": _slice_tensor_batch(step["teacher_logprob"], local_idx),
+                }
+            )
+
+        sample_trace = {
+            "prompt": prompt,
+            "seed": seed,
+            "sample_index": sample_index,
+            "x_T": _slice_tensor_batch(trace["x_T"], local_idx),
+            "sigmas": trace["sigmas"].detach().cpu().contiguous(),
+            "timesteps": trace["timesteps"].detach().cpu().contiguous(),
+            "steps": sample_steps,
+            "teacher_logprob_mode": trace.get("teacher_logprob_mode"),
+            "final_latents": _slice_tensor_batch(trace.get("final_latents"), local_idx),
+            "decoded_video": _slice_tensor_batch(videos, local_idx),
+            "decoded_video_path": os.path.join(output_dir, f"video_{sample_index}.mp4"),
+            "reward": _select_reward_for_sample(rewards, local_idx),
+        }
+        trace_path = os.path.join(trace_dir, f"trace_{sample_index}.pt")
+        torch.save(sample_trace, trace_path)
+        saved_paths.append(trace_path)
+    return saved_paths
+
+
 def main(config):
     logger = get_logger()
 
@@ -70,6 +151,20 @@ def main(config):
 
     # save config
     output_dir = config.get("output_dir", "./output")
+    trace_config = config.get("denoising_trace_config", {})
+    save_denoising_trace = trace_config.get("enabled", config.get("save_denoising_trace", True))
+    denoising_trace_dir = trace_config.get(
+        "output_dir",
+        config.get("denoising_trace_dir", os.path.join(output_dir, "denoising_traces")),
+    )
+    save_teacher_logprob = trace_config.get(
+        "save_teacher_logprob",
+        config.get("save_teacher_logprob", True),
+    )
+    reward_fn_config = trace_config.get(
+        "reward_fn",
+        config.get("reward_fn", config.get("rl_config", {}).get("reward_fn", {})),
+    )
     # distributed setup
     setup_distributed_env()
     
@@ -218,6 +313,13 @@ def main(config):
     sp_rank = sp_state.global_sp_rank
     sp_size = sp_state.global_sp_size
     sp_group = sp_state.global_sp_group
+    should_save_trace_on_rank = save_denoising_trace and sp_rank == 0
+
+    reward_fn = None
+    if should_save_trace_on_rank and reward_fn_config:
+        logger.info(f"rank {rank} initializing reward functions with config: {reward_fn_config}")
+        import ospnext.rewards.rewards
+        reward_fn = getattr(ospnext.rewards.rewards, "multi_score")(device, reward_fn_config)
 
     if len(prompts) % dp_size > 0:
         log_on_main_process(logger, f"Warning! Caused by using FSDP, we will pad some dummy data to make sure len(prompts) {len(prompts)} == dp_size {dp_size}.")
@@ -227,17 +329,44 @@ def main(config):
     video_grid = []
     for index in range(dp_rank * batch_size, len(prompts), batch_size * dp_size):
         batch_prompts = prompts[index: index + batch_size]
-        videos = pipeline(
+        pipeline_output = pipeline(
             prompt=batch_prompts,
             num_frames=num_frames,
             height=height,
             width=width,
             seed=seed,
             max_sequence_length=512,
-            device=device
+            device=device,
+            return_trace=should_save_trace_on_rank,
+            compute_teacher_logprob=save_teacher_logprob,
         )
+        if should_save_trace_on_rank:
+            videos = pipeline_output["videos"]
+            denoising_trace = pipeline_output["denoising_trace"]
+        else:
+            videos = pipeline_output
         if sp_rank == 0:
             save_videos(videos, index, output_dir, save_fps)
+            rewards = None
+            if reward_fn is not None:
+                rewards, _ = reward_fn(
+                    videos.numpy(),
+                    batch_prompts,
+                    [{} for _ in batch_prompts],
+                    True,
+                )
+            if should_save_trace_on_rank:
+                saved_trace_paths = save_denoising_traces(
+                    trace=denoising_trace,
+                    videos=videos,
+                    prompts=batch_prompts,
+                    seed=seed,
+                    start_index=index,
+                    output_dir=output_dir,
+                    trace_dir=denoising_trace_dir,
+                    rewards=rewards,
+                )
+                logger.info(f"rank {rank} saved denoising traces: {saved_trace_paths}")
             video_grid.append(videos)
 
     if len(video_grid) > 0:
