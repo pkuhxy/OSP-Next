@@ -14,6 +14,7 @@
 *.pt
 *.pth
 *.ckpt
+ckpts/
 *.safetensors
 *.json
 # *.txt

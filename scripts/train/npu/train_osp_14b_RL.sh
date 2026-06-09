@@ -1,3 +1,6 @@
+echo "start process..."
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 export WANDB_MODE="offline"
 
 export TOKENIZERS_PARALLELISM=false
@@ -18,18 +21,42 @@ export HCCL_EXEC_TIMEOUT=0
 export ACL_DEVICE_SYNC_TIMEOUT=3600
 
 
-MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+# Processes per node. Prefer platform variables, but keep manual overrides.
+NPROC_PER_NODE=${NPROC_PER_NODE:-${NPRC_PER_NODE:-${MA_NUM_GPUS:-16}}}
+
+# Total node count.
+NNODES=${NNODES:-${PET_NNODES:-${MA_NUM_HOSTS:-1}}}
+
+# Current node rank.
+NODE_RANK=${NODE_RANK:-${RANK:-${VC_TASK_INDEX:-0}}}
+
+# Master address. On ModelArts-style jobs, VC_WORKER_HOSTS is a comma-separated
+# hostname list; the first host is used as the rendezvous master.
+if [ -z "${MASTER_ADDR}" ]; then
+  if [ -n "${VC_WORKER_HOSTS}" ]; then
+    MASTER_HOSTNAME=$(echo "${VC_WORKER_HOSTS}" | cut -d',' -f1)
+    MASTER_ADDR=$(python3 -c "import socket; print(socket.gethostbyname('${MASTER_HOSTNAME}'))")
+  else
+    MASTER_ADDR=127.0.0.1
+  fi
+fi
+
 MASTER_PORT=${MASTER_PORT:-29505}
-NPRC_PER_NODE=${NPRC_PER_NODE:-16}
-NNODES=${PET_NNODES:-1}
-NODE_RANK=${RANK:-0}
-WORLD_SIZE=$(($NNODES * $NPRC_PER_NODE))
+WORLD_SIZE=$((${NNODES} * ${NPROC_PER_NODE}))
+
+echo "MASTER_ADDR=${MASTER_ADDR}"
+echo "MASTER_PORT=${MASTER_PORT}"
+echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
+echo "NNODES=${NNODES}"
+echo "NODE_RANK=${NODE_RANK}"
+echo "WORLD_SIZE=${WORLD_SIZE}"
 
 
 torchrun \
-  --nproc_per_node=${NPRC_PER_NODE} \
+  --nproc_per_node=${NPROC_PER_NODE} \
   --nnodes=${NNODES} \
+  --node_rank=${NODE_RANK} \
   --master_addr=${MASTER_ADDR} \
   --master_port=${MASTER_PORT} \
-  train/train_osp_RL.py \
-  --config configs/train/npu/osp_14b_RL.yaml
+  train/train_osp_RL_luffy.py \
+  --config configs/train/npu/osp_14b_RL_luffy.yaml

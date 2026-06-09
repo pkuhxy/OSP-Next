@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 
-def videoalign_score(device, load_from_pretrained=None, reward_dim="Overall", use_norm=True,
+def videoalign_score(device, load_from_pretrained="/home/ma-user/work/xianyi/ckpts/KlingTeam/VideoReward", reward_dim="Overall", use_norm=True,
                      videoalign_root=None, save_fps=8, num_frames=None, fps=None, max_pixels=None):
     """
     VideoAlign video quality reward.
