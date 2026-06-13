@@ -6,6 +6,7 @@ import time
 import json
 import random
 import tempfile
+import faulthandler
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
@@ -968,6 +969,17 @@ def main(config):
     gt_teacher_train_batch_size = max(1, int(gt_teacher_config.get("train_batch_size", train_batch_size)))
     gt_teacher_every_n_steps = max(1, int(gt_teacher_config.get("every_n_steps", 1)))
 
+    debug_training_config = rl_config.get("debug_training", {})
+    if isinstance(debug_training_config, bool):
+        debug_training_config = {"enable": debug_training_config}
+    debug_training = bool(debug_training_config.get("enable", False))
+    debug_training_epochs = max(1, int(debug_training_config.get("epochs", 1)))
+    debug_training_inner_epochs = max(1, int(debug_training_config.get("inner_epochs", 1)))
+    debug_training_micro_batches = max(1, int(debug_training_config.get("micro_batches", 1)))
+    debug_training_timesteps = max(1, int(debug_training_config.get("timesteps", 1)))
+    debug_training_sync = bool(debug_training_config.get("sync", True))
+    debug_stack_timeout = int(debug_training_config.get("stack_timeout_seconds", 600))
+
     # EMA config
     ema_decay = config.get("ema_decay", 0.9999)
     ema_update_interval = config.get("ema_update_interval", 1)
@@ -1009,6 +1021,52 @@ def main(config):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device(f"cuda:{local_rank}")
     weight_dtype = str_to_precision(weight_dtype)
+
+    if debug_training:
+        faulthandler.enable()
+        if debug_stack_timeout > 0:
+            faulthandler.dump_traceback_later(debug_stack_timeout, repeat=True)
+
+    def should_debug_train(epoch_idx=None, inner_idx=None, micro_idx=None, timestep_idx=None):
+        if not debug_training:
+            return False
+        if epoch_idx is not None and epoch_idx >= start_epoch + debug_training_epochs:
+            return False
+        if inner_idx is not None and inner_idx >= debug_training_inner_epochs:
+            return False
+        if micro_idx is not None and micro_idx >= debug_training_micro_batches:
+            return False
+        if timestep_idx is not None and timestep_idx >= debug_training_timesteps:
+            return False
+        return True
+
+    def debug_train_log(stage, epoch_idx=None, inner_idx=None, micro_idx=None, timestep_idx=None, extra="", sync=False):
+        if not should_debug_train(epoch_idx, inner_idx, micro_idx, timestep_idx):
+            return
+        context = []
+        if epoch_idx is not None:
+            context.append(f"epoch={epoch_idx}")
+        if inner_idx is not None:
+            context.append(f"inner={inner_idx}")
+        if micro_idx is not None:
+            context.append(f"mb={micro_idx}")
+        if timestep_idx is not None:
+            context.append(f"t={timestep_idx}")
+        context = " ".join(context)
+        if extra:
+            extra = f" | {extra}"
+        print(
+            f"[TRAIN-DBG][rank={rank}/{world_size}][local={local_rank}] "
+            f"{stage} {context}{extra} | mem={get_memory_allocated()}GiB",
+            flush=True,
+        )
+        if sync:
+            torch.cuda.synchronize()
+            print(
+                f"[TRAIN-DBG][rank={rank}/{world_size}][local={local_rank}] "
+                f"{stage}:sync_done {context} | mem={get_memory_allocated()}GiB",
+                flush=True,
+            )
 
     wandb_config = config.get("wandb_config", {})
     if wandb_config.get("project_name", None) is not None and rank == 0:
@@ -1453,6 +1511,8 @@ def main(config):
     GT teacher positive only: {gt_teacher_positive_only}
     GT teacher train batch size: {gt_teacher_train_batch_size}
     GT teacher every n steps: {gt_teacher_every_n_steps}
+    Debug training trace: {debug_training}
+    Debug trace scope: epochs={debug_training_epochs}, inner_epochs={debug_training_inner_epochs}, micro_batches={debug_training_micro_batches}, timesteps={debug_training_timesteps}, sync={debug_training_sync}, stack_timeout={debug_stack_timeout}s
     Per-prompt stat tracking: {per_prompt_stat_tracking}
     Gradient checkpointing: {gradient_checkpointing}
     Weight dtype: {weight_dtype}
@@ -1967,11 +2027,28 @@ def main(config):
             if reshard_after_forward is not None and not reshard_after_forward:
                 model.set_reshard_after_forward(reshard_after_forward, recurse=True)
 
+            debug_train_log(
+                "inner_start",
+                epoch,
+                inner_epoch,
+                extra=(
+                    f"total_batch_size_local={total_batch_size_local}, "
+                    f"train_batch_size={train_batch_size}, "
+                    f"gt_teacher_count={len(gt_teacher_data['latents']) if gt_teacher_data is not None else 0}"
+                ),
+            )
+            debug_train_log("perm_randperm_before", epoch, inner_epoch)
             perm = torch.randperm(total_batch_size_local, device=device)
+            debug_train_log("perm_randperm_after", epoch, inner_epoch, sync=debug_training_sync)
             if use_global_sequence_parallel:
+                debug_train_log("perm_broadcast_before", epoch, inner_epoch)
                 torch.distributed.broadcast(perm, group_src=0, group=global_sp_group)
+                debug_train_log("perm_broadcast_after", epoch, inner_epoch, sync=debug_training_sync)
+            debug_train_log("perm_cpu_before", epoch, inner_epoch)
             perm = perm.cpu()
+            debug_train_log("perm_cpu_after", epoch, inner_epoch)
 
+            debug_train_log("sample_shuffle_before", epoch, inner_epoch)
             samples = {
                 k: (
                     {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
@@ -1980,17 +2057,27 @@ def main(config):
                 )
                 for k, v in samples.items()
             }
+            debug_train_log("sample_shuffle_after", epoch, inner_epoch)
 
             gt_teacher_epoch_data = None
             if gt_teacher_data is not None:
                 gt_teacher_total = len(gt_teacher_data["latents"])
+                debug_train_log("gt_perm_randperm_before", epoch, inner_epoch, extra=f"gt_teacher_total={gt_teacher_total}")
                 gt_perm = torch.randperm(gt_teacher_total, device=device)
+                debug_train_log("gt_perm_randperm_after", epoch, inner_epoch, sync=debug_training_sync)
                 if use_global_sequence_parallel:
+                    debug_train_log("gt_perm_broadcast_before", epoch, inner_epoch)
                     torch.distributed.broadcast(gt_perm, group_src=0, group=global_sp_group)
+                    debug_train_log("gt_perm_broadcast_after", epoch, inner_epoch, sync=debug_training_sync)
+                debug_train_log("gt_perm_cpu_before", epoch, inner_epoch)
                 gt_perm = gt_perm.cpu()
+                debug_train_log("gt_perm_cpu_after", epoch, inner_epoch)
+                debug_train_log("gt_teacher_shuffle_before", epoch, inner_epoch)
                 gt_teacher_epoch_data = {k: v[gt_perm] for k, v in gt_teacher_data.items()}
+                debug_train_log("gt_teacher_shuffle_after", epoch, inner_epoch)
 
             num_micro_batches = max(1, total_batch_size_local // train_batch_size)
+            debug_train_log("micro_batches_ready", epoch, inner_epoch, extra=f"num_micro_batches={num_micro_batches}")
 
             info = defaultdict(list)
             gt_teacher_cursor = 0
@@ -2001,6 +2088,13 @@ def main(config):
             ):
                 mb_start = mb_idx * train_batch_size
                 mb_end = min(mb_start + train_batch_size, total_batch_size_local)
+                debug_train_log(
+                    "micro_batch_to_device_before",
+                    epoch,
+                    inner_epoch,
+                    mb_idx,
+                    extra=f"range={mb_start}:{mb_end}",
+                )
                 micro_batch = {
                     k: (
                         {sub_k: sub_v[mb_start:mb_end].to(device) for sub_k, sub_v in v.items()}
@@ -2009,12 +2103,24 @@ def main(config):
                     )
                     for k, v in samples.items()
                 }
+                debug_train_log(
+                    "micro_batch_to_device_after",
+                    epoch,
+                    inner_epoch,
+                    mb_idx,
+                    extra=f"batch={len(micro_batch['timesteps'])}",
+                    sync=debug_training_sync,
+                )
 
                 embeds = micro_batch["prompt_embeds"]
                 neg_embeds = micro_batch["neg_prompt_embeds"] if use_cfg_in_train else None
 
                 for j in train_timestep_indices:
+                    debug_train_log("timestep_start", epoch, inner_epoch, mb_idx, j)
+                    debug_train_log("pre_forward_sync_before", epoch, inner_epoch, mb_idx, j)
                     torch.cuda.synchronize()
+                    debug_train_log("pre_forward_sync_after", epoch, inner_epoch, mb_idx, j)
+                    debug_train_log("policy_forward_before", epoch, inner_epoch, mb_idx, j)
                     with torch.autocast("cuda", dtype=weight_dtype):
                         prev_sample, log_prob, prev_sample_mean, std_dev_t, dt = compute_log_prob_for_training(
                             model=model,
@@ -2029,10 +2135,13 @@ def main(config):
                             start_frame_latents=None,
                             sp_group=global_sp_group,
                         )
+                    debug_train_log("policy_forward_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
 
-                        if kl_beta > 0:
-                            with torch.no_grad():
-                                with model.disable_adapter():
+                    if kl_beta > 0:
+                        debug_train_log("ref_forward_before", epoch, inner_epoch, mb_idx, j)
+                        with torch.no_grad():
+                            with model.disable_adapter():
+                                with torch.autocast("cuda", dtype=weight_dtype):
                                     _, _, ref_prev_sample_mean, ref_std_dev_t, ref_dt = compute_log_prob_for_training(
                                         model=model,
                                         sample=micro_batch,
@@ -2046,6 +2155,7 @@ def main(config):
                                         start_frame_latents=None,
                                         sp_group=global_sp_group,
                                     )
+                        debug_train_log("ref_forward_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
 
                     if micro_batch["advantages"].dim() > 1:
                         adv = torch.clamp(micro_batch["advantages"][:, j], -adv_clip_max, adv_clip_max)
@@ -2070,7 +2180,9 @@ def main(config):
                     info["policy_loss"].append(policy_loss.detach())
 
                     loss = loss / accum_steps_total
+                    debug_train_log("policy_backward_before", epoch, inner_epoch, mb_idx, j)
                     loss.backward()
+                    debug_train_log("policy_backward_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
                     total_loss_for_log = loss.detach()
 
                     info["approx_kl"].append(approx_kl)
@@ -2089,10 +2201,20 @@ def main(config):
                         gt_teacher_total = len(gt_teacher_epoch_data["latents"])
                         gt_indices = (torch.arange(gt_teacher_train_batch_size) + gt_teacher_cursor) % gt_teacher_total
                         gt_teacher_cursor += gt_teacher_train_batch_size
+                        debug_train_log(
+                            "gt_teacher_to_device_before",
+                            epoch,
+                            inner_epoch,
+                            mb_idx,
+                            j,
+                            extra=f"gt_teacher_total={gt_teacher_total}, gt_batch={gt_teacher_train_batch_size}",
+                        )
                         gt_teacher_micro_batch = {
                             k: v[gt_indices].to(device)
                             for k, v in gt_teacher_epoch_data.items()
                         }
+                        debug_train_log("gt_teacher_to_device_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
+                        debug_train_log("gt_teacher_forward_before", epoch, inner_epoch, mb_idx, j)
                         with torch.autocast("cuda", dtype=weight_dtype):
                             gt_teacher_loss, gt_teacher_metrics = compute_gt_teacher_forcing_loss(
                                 model=model,
@@ -2106,6 +2228,7 @@ def main(config):
                                 positive_only=gt_teacher_positive_only,
                                 sp_group=global_sp_group,
                             )
+                        debug_train_log("gt_teacher_forward_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
 
                         info["gt_teacher_loss"].append(gt_teacher_loss.detach())
                         if gt_teacher_metrics is not None:
@@ -2117,7 +2240,9 @@ def main(config):
                             )
                         if gt_teacher_loss.requires_grad:
                             gt_teacher_loss = gt_teacher_loss / accum_steps_total
+                            debug_train_log("gt_teacher_backward_before", epoch, inner_epoch, mb_idx, j)
                             gt_teacher_loss.backward()
+                            debug_train_log("gt_teacher_backward_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
                             total_loss_for_log = total_loss_for_log + gt_teacher_loss.detach()
                         del gt_teacher_micro_batch, gt_teacher_loss
 
@@ -2126,10 +2251,18 @@ def main(config):
                     backward_counter += 1
 
                     if backward_counter % accum_steps_total == 0:
+                        debug_train_log("grad_clip_before", epoch, inner_epoch, mb_idx, j)
                         grad_norm = adaptive_grad_clipper.adaptive_clip(trainable_parameters)
+                        debug_train_log("grad_clip_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
+                        debug_train_log("optimizer_step_before", epoch, inner_epoch, mb_idx, j)
                         optimizer.step()
+                        debug_train_log("optimizer_step_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
+                        debug_train_log("zero_grad_before", epoch, inner_epoch, mb_idx, j)
                         model.zero_grad(set_to_none=True)
+                        debug_train_log("zero_grad_after", epoch, inner_epoch, mb_idx, j)
+                        debug_train_log("ema_update_before", epoch, inner_epoch, mb_idx, j)
                         ema_model.update(model, global_step + 1)
+                        debug_train_log("ema_update_after", epoch, inner_epoch, mb_idx, j)
                         global_step += 1
 
                         if len(info) > 0:

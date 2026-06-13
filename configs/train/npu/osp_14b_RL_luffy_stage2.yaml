@@ -116,3 +116,11 @@ rl_config:
     positive_only: True
     train_batch_size: 2
     every_n_steps: 1
+  debug_training:
+    enable: True
+    epochs: 1
+    inner_epochs: 1
+    micro_batches: 1
+    timesteps: 10
+    sync: True
+    stack_timeout_seconds: 600
