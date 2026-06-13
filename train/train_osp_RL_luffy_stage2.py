@@ -2001,6 +2001,32 @@ def main(config):
                     clipped_loss = -adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
                     policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
+                    if kl_beta > 0:
+                        kl_loss = ((prev_sample_mean - ref_prev_sample_mean) ** 2).mean(dim=(1, 2, 3, 4)) / (2 * (std_dev_t * ref_dt) ** 2).squeeze()
+                        kl_loss = torch.mean(kl_loss)
+                        loss = policy_loss + kl_beta * kl_loss
+                        info["kl_loss"].append(kl_loss.detach())
+                    else:
+                        loss = policy_loss
+
+                    approx_kl = 0.5 * torch.mean((log_prob - micro_batch["log_probs"][:, j]) ** 2).detach()
+                    clipfrac = torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).detach()
+                    info["policy_loss"].append(policy_loss.detach())
+
+                    loss = loss / accum_steps_total
+                    loss.backward()
+                    total_loss_for_log = loss.detach()
+
+                    info["approx_kl"].append(approx_kl)
+                    info["clipfrac"].append(clipfrac)
+
+                    # Backprop the policy/kl graph before the GT teacher-forcing
+                    # forward so their model activations do not overlap in memory.
+                    del prev_sample, log_prob, prev_sample_mean, std_dev_t, dt
+                    del ratio, unclipped_loss, clipped_loss, policy_loss, loss
+                    if kl_beta > 0:
+                        del ref_prev_sample_mean, ref_std_dev_t, ref_dt, kl_loss
+
                     gt_teacher_loss = None
                     gt_teacher_metrics = None
                     if gt_teacher_epoch_data is not None and (j % gt_teacher_every_n_steps == 0):
@@ -2025,15 +2051,6 @@ def main(config):
                                 sp_group=global_sp_group,
                             )
 
-                    if kl_beta > 0:
-                        kl_loss = ((prev_sample_mean - ref_prev_sample_mean) ** 2).mean(dim=(1, 2, 3, 4)) / (2 * (std_dev_t * ref_dt) ** 2).squeeze()
-                        kl_loss = torch.mean(kl_loss)
-                        loss = policy_loss + kl_beta * kl_loss
-                        info["kl_loss"].append(kl_loss.detach())
-                    else:
-                        loss = policy_loss
-                    if gt_teacher_loss is not None:
-                        loss = loss + gt_teacher_loss
                         info["gt_teacher_loss"].append(gt_teacher_loss.detach())
                         if gt_teacher_metrics is not None:
                             info["gt_teacher_active_ratio"].append(
@@ -2042,18 +2059,13 @@ def main(config):
                             info["gt_teacher_adv_mean"].append(
                                 torch.tensor(gt_teacher_metrics["gt_teacher/adv_mean"], device=device)
                             )
+                        if gt_teacher_loss.requires_grad:
+                            gt_teacher_loss = gt_teacher_loss / accum_steps_total
+                            gt_teacher_loss.backward()
+                            total_loss_for_log = total_loss_for_log + gt_teacher_loss.detach()
+                        del gt_teacher_micro_batch, gt_teacher_loss
 
-                    loss = loss / accum_steps_total
-                    loss.backward()
-
-                    info["approx_kl"].append(
-                        0.5 * torch.mean((log_prob - micro_batch["log_probs"][:, j]) ** 2).detach()
-                    )
-                    info["clipfrac"].append(
-                        torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).detach()
-                    )
-                    info["policy_loss"].append(policy_loss.detach())
-                    info["loss"].append(loss.detach())
+                    info["loss"].append(total_loss_for_log)
 
                     backward_counter += 1
 
