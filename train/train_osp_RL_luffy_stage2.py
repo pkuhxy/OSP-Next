@@ -1024,8 +1024,6 @@ def main(config):
 
     if debug_training:
         faulthandler.enable()
-        if debug_stack_timeout > 0:
-            faulthandler.dump_traceback_later(debug_stack_timeout, repeat=True)
 
     def should_debug_train(epoch_idx=None, inner_idx=None, micro_idx=None, timestep_idx=None):
         if not debug_training:
@@ -1043,6 +1041,10 @@ def main(config):
     def debug_train_log(stage, epoch_idx=None, inner_idx=None, micro_idx=None, timestep_idx=None, extra="", sync=False):
         if not should_debug_train(epoch_idx, inner_idx, micro_idx, timestep_idx):
             return
+        arm_stack_timer = debug_stack_timeout > 0 and (stage.endswith("_before") or sync)
+        if arm_stack_timer:
+            faulthandler.cancel_dump_traceback_later()
+            faulthandler.dump_traceback_later(debug_stack_timeout, repeat=True)
         context = []
         if epoch_idx is not None:
             context.append(f"epoch={epoch_idx}")
@@ -1067,6 +1069,8 @@ def main(config):
                 f"{stage}:sync_done {context} | mem={get_memory_allocated()}GiB",
                 flush=True,
             )
+        if debug_stack_timeout > 0 and not stage.endswith("_before"):
+            faulthandler.cancel_dump_traceback_later()
 
     wandb_config = config.get("wandb_config", {})
     if wandb_config.get("project_name", None) is not None and rank == 0:
