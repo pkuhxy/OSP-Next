@@ -477,12 +477,14 @@ def compute_gt_teacher_forcing_loss(
     if positive_only:
         active = adv > 0
         if not active.any():
+            loss = loss_weight * per_sample_loss.sum() * 0.0
             metrics = {
                 "gt_teacher/loss_raw": 0.0,
+                "gt_teacher/loss_weighted": 0.0,
                 "gt_teacher/adv_mean": float(adv.mean().detach().cpu()),
                 "gt_teacher/active_ratio": 0.0,
             }
-            return gt_latents.new_zeros(()), metrics
+            return loss, metrics
         weighted_loss = (per_sample_loss[active] * adv[active].detach()).mean()
         active_ratio = active.float().mean()
     else:
@@ -729,7 +731,7 @@ class PerPromptStatTracker:
         prompts = np.array(prompts)
         rewards = np.array(rewards, dtype=np.float64)
         unique = np.unique(prompts)
-        advantages = np.empty_like(rewards) * 0.0
+        advantages = np.zeros_like(rewards)
         for prompt in unique:
             prompt_rewards = rewards[prompts == prompt]
             if prompt not in self.stats:
@@ -744,7 +746,7 @@ class PerPromptStatTracker:
         if ref_prompts is not None and ref_rewards is not None:
             ref_prompts = np.array(ref_prompts)
             global_ref_rewards = np.array(ref_rewards, dtype=np.float64)
-            ref_advantages = np.empty_like(global_ref_rewards) * 0.0
+            ref_advantages = np.zeros_like(global_ref_rewards)
             for prompt in np.unique(ref_prompts):
                 if prompt not in self.stats:
                     self.stats[prompt] = []
@@ -1525,12 +1527,18 @@ def main(config):
             group_keys = batch.get("group_key", prompts)
             unique_gt_indices = []
             gt_group_keys = []
+            teacher_gt_indices = []
+            teacher_gt_group_keys = []
 
             # Off-policy GT guidance: score the ground-truth video for this batch.
             # The reward joins the GRPO group (advantage baseline) but the GT
             # trajectory itself never enters `samples`, so it cannot affect the
             # gradient / parameter update.
             if use_gt_guidance and VIDEO in batch and batch[VIDEO] is not None:
+                if use_gt_teacher_forcing:
+                    teacher_gt_indices = list(range(len(group_keys)))
+                    teacher_gt_group_keys = list(group_keys)
+
                 for local_idx, group_key in enumerate(group_keys):
                     if group_key in gt_seen_group_keys:
                         continue
@@ -1561,18 +1569,18 @@ def main(config):
                 text_embeddings = text_encoder(prompt_ids, prompt_mask)
             torch.cuda.synchronize()
 
-            if use_gt_teacher_forcing and unique_gt_indices:
+            if use_gt_teacher_forcing and teacher_gt_indices:
                 with torch.no_grad():
-                    gt_videos_for_teacher = batch[VIDEO][unique_gt_indices].to(
+                    gt_videos_for_teacher = batch[VIDEO][teacher_gt_indices].to(
                         device=device,
                         dtype=torch.float32,
                         non_blocking=True,
                     )
                     gt_latents = vae.encode(gt_videos_for_teacher)
                 gt_teacher_samples.append({
-                    "group_keys": list(gt_group_keys),
+                    "group_keys": list(teacher_gt_group_keys),
                     "latents": gt_latents.detach().cpu(),
-                    "prompt_embeds": text_embeddings[unique_gt_indices].detach().cpu(),
+                    "prompt_embeds": text_embeddings[teacher_gt_indices].detach().cpu(),
                 })
                 del gt_videos_for_teacher, gt_latents
 
@@ -1873,6 +1881,28 @@ def main(config):
                     "prompt_embeds": torch.cat([s["prompt_embeds"] for s in prepared_gt_teacher_samples], dim=0),
                     "advantages": torch.cat([s["advantages"] for s in prepared_gt_teacher_samples], dim=0),
                 }
+
+        if use_gt_teacher_forcing:
+            local_teacher_count = len(gt_teacher_data["latents"]) if gt_teacher_data is not None else 0
+            min_teacher_count = torch.tensor(local_teacher_count, device=device, dtype=torch.long)
+            max_teacher_count = torch.tensor(local_teacher_count, device=device, dtype=torch.long)
+            dist.all_reduce(min_teacher_count, op=dist.ReduceOp.MIN)
+            dist.all_reduce(max_teacher_count, op=dist.ReduceOp.MAX)
+            synced_teacher_count = int(min_teacher_count.item())
+            if rank == 0 and int(max_teacher_count.item()) != synced_teacher_count:
+                log_on_main_process(
+                    logger,
+                    "GT teacher sample count differs across ranks; "
+                    f"truncate to global min {synced_teacher_count} "
+                    f"(max {int(max_teacher_count.item())}).",
+                )
+            if synced_teacher_count == 0:
+                gt_teacher_data = None
+            elif gt_teacher_data is not None:
+                gt_teacher_data = {
+                    k: v[:synced_teacher_count]
+                    for k, v in gt_teacher_data.items()
+                }
                 if rank == 0:
                     log_on_main_process(
                         logger,
@@ -1903,6 +1933,32 @@ def main(config):
         samples = {k: v[mask] for k, v in samples.items()}
 
         total_batch_size_local = len(samples["timesteps"])
+        min_train_count = torch.tensor(total_batch_size_local, device=device, dtype=torch.long)
+        max_train_count = torch.tensor(total_batch_size_local, device=device, dtype=torch.long)
+        dist.all_reduce(min_train_count, op=dist.ReduceOp.MIN)
+        dist.all_reduce(max_train_count, op=dist.ReduceOp.MAX)
+        synced_train_count = int(min_train_count.item())
+        if synced_train_count <= 0:
+            raise RuntimeError(
+                "No rollout samples remain after advantage masking on at least one rank."
+            )
+        if int(max_train_count.item()) != synced_train_count and rank == 0:
+            log_on_main_process(
+                logger,
+                "Rollout sample count differs across ranks after advantage masking; "
+                f"truncate to global min {synced_train_count} "
+                f"(max {int(max_train_count.item())}).",
+            )
+        if total_batch_size_local != synced_train_count:
+            samples = {
+                k: (
+                    {sub_k: sub_v[:synced_train_count] for sub_k, sub_v in v.items()}
+                    if isinstance(v, dict)
+                    else v[:synced_train_count]
+                )
+                for k, v in samples.items()
+            }
+            total_batch_size_local = synced_train_count
 
         backward_counter = 0
 
