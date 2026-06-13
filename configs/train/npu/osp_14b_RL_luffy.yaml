@@ -1,7 +1,7 @@
 model_name: "osp_next"
 seed: 42
 
-output_dir: "/home/ma-user/work/xianyi/osp_next/OSP-Next/ckpts/video_luffy"
+output_dir: "/home/ma-user/work/xianyi/osp_next/OSP-Next/ckpts/video_luffy_stage1"
 
 num_epochs: 1000
 # ddp_size: 1
@@ -26,7 +26,7 @@ encoder_cpu_offload: False
 profiling: False
 
 wandb_config:
-  project_name: "osp_next_RL_luffy"
+  project_name: "osp_next_RL_luffy_stage1"
   exp_name: "osp_next_RL_luffy_rank32_lr4e-4"
 
 model_config:
@@ -106,5 +106,5 @@ rl_config:
   gt_guidance: 
     enable: True
     prompt_file: "/home/ma-user/work/xianyi/osp_next/dataset/vbench/vbench_train.txt"
-    gt_video_dir: "/home/ma-user/work/xianyi/osp_next/dataset/wan14B"
+    gt_video_dir: "/home/ma-user/work/xianyi/osp_next/dataset/wan14B_offline"
     
