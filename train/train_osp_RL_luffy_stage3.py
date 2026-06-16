@@ -952,6 +952,21 @@ def _trace_reward_to_scalar(reward):
     return float(reward)
 
 
+def _select_batched_reward(rewards, sample_idx):
+    if isinstance(rewards, dict):
+        return {
+            key: _select_batched_reward(value, sample_idx)
+            for key, value in rewards.items()
+        }
+    if isinstance(rewards, torch.Tensor):
+        return rewards[sample_idx]
+    if isinstance(rewards, np.ndarray):
+        return rewards[sample_idx]
+    if isinstance(rewards, (list, tuple)):
+        return rewards[sample_idx]
+    return rewards
+
+
 def _discover_trace_paths(trace_dir=None, trace_files=None):
     paths = []
     if trace_files is not None:
@@ -993,6 +1008,7 @@ class DenoisingTraceDataset(Dataset):
         max_steps=None,
         step_stride=1,
         require_teacher_logprob=True,
+        allow_missing_reward=False,
     ):
         self.trace_paths = _discover_trace_paths(trace_dir=trace_dir, trace_files=trace_files)
         self.text_processor = WanTextProcessor(
@@ -1003,8 +1019,19 @@ class DenoisingTraceDataset(Dataset):
         self.max_steps = None if max_steps is None else int(max_steps)
         self.step_stride = max(1, int(step_stride))
         self.require_teacher_logprob = require_teacher_logprob
+        self.allow_missing_reward = allow_missing_reward
+        self.advantage_mode = advantage_mode
         self.records = self._load_records()
-        self._attach_advantages(advantage_mode)
+        if self.has_missing_rewards:
+            if not self.allow_missing_reward:
+                raise ValueError(
+                    "Some off-policy traces do not contain rewards. Regenerate traces with "
+                    "denoising_trace_config.reward_fn set, or set "
+                    "rl_config.offpolicy_guidance.score_missing_rewards=True to score "
+                    "decoded_video from the traces during training startup."
+                )
+        else:
+            self.finalize_advantages()
 
     def _load_records(self):
         records = []
@@ -1013,15 +1040,44 @@ class DenoisingTraceDataset(Dataset):
             prompt = trace.get("prompt", "")
             if not prompt:
                 raise ValueError(f"Trace {trace_path} does not contain a non-empty prompt.")
-            reward = _trace_reward_to_scalar(trace.get("reward", None))
+            trace_reward = trace.get("reward", None)
+            reward = None if trace_reward is None else _trace_reward_to_scalar(trace_reward)
             records.append({
                 "path": trace_path,
                 "prompt": prompt,
                 "reward": reward,
                 "sample_index": trace.get("sample_index", len(records)),
+                "decoded_video_path": trace.get("decoded_video_path", None),
             })
             del trace
         return records
+
+    @property
+    def has_missing_rewards(self):
+        return any(record["reward"] is None for record in self.records)
+
+    def missing_reward_indices(self):
+        return [idx for idx, record in enumerate(self.records) if record["reward"] is None]
+
+    def load_decoded_video_for_reward(self, idx):
+        trace = torch.load(self.records[idx]["path"], map_location="cpu")
+        decoded_video = trace.get("decoded_video", None)
+        if decoded_video is None:
+            raise ValueError(
+                f"Trace {self.records[idx]['path']} is missing both reward and decoded_video. "
+                "Regenerate traces with denoising_trace_config.enabled=True using the current infer_osp.py, "
+                "or save rewards into the trace."
+            )
+        return torch.as_tensor(decoded_video).cpu()
+
+    def set_reward(self, idx, reward):
+        self.records[idx]["reward"] = float(reward)
+
+    def finalize_advantages(self):
+        if self.has_missing_rewards:
+            missing = self.missing_reward_indices()
+            raise ValueError(f"Cannot finalize off-policy advantages; missing rewards for traces: {missing[:5]}")
+        self._attach_advantages(self.advantage_mode)
 
     def _attach_advantages(self, advantage_mode):
         advantage_mode = (advantage_mode or "global").lower()
@@ -1128,6 +1184,60 @@ class DenoisingTraceDataset(Dataset):
             ),
             "trace_advantages": torch.stack([example["trace_advantage"] for example in examples], dim=0),
         }
+
+
+def fill_missing_trace_rewards(
+    trace_dataset,
+    reward_fn,
+    batch_size=1,
+    logger=None,
+):
+    missing_indices = trace_dataset.missing_reward_indices()
+    if not missing_indices:
+        trace_dataset.finalize_advantages()
+        return
+
+    computed_rewards = None
+    if dist.get_rank() == 0:
+        if logger is not None:
+            logger.info(f"Scoring {len(missing_indices)} off-policy traces with missing rewards...")
+        computed_rewards = []
+        for start in tqdm(
+            range(0, len(missing_indices), batch_size),
+            desc="Scoring off-policy traces",
+            disable=False,
+        ):
+            batch_indices = missing_indices[start:start + batch_size]
+            videos = []
+            prompts = []
+            metadata = []
+            for trace_idx in batch_indices:
+                videos.append(trace_dataset.load_decoded_video_for_reward(trace_idx))
+                prompts.append(trace_dataset.records[trace_idx]["prompt"])
+                metadata.append({
+                    "trace_path": trace_dataset.records[trace_idx]["path"],
+                    "decoded_video_path": trace_dataset.records[trace_idx].get("decoded_video_path"),
+                })
+            videos = torch.stack(videos, dim=0).numpy()
+            rewards, _ = reward_fn(videos, prompts, metadata, True)
+            computed_rewards.extend(
+                _trace_reward_to_scalar(_select_batched_reward(rewards, local_idx))
+                for local_idx in range(len(batch_indices))
+            )
+        if logger is not None:
+            logger.info("Finished scoring missing off-policy trace rewards.")
+
+    reward_payload = [computed_rewards]
+    dist.broadcast_object_list(reward_payload, src=0)
+    computed_rewards = reward_payload[0]
+    if len(computed_rewards) != len(missing_indices):
+        raise RuntimeError(
+            f"Expected {len(missing_indices)} off-policy rewards, got {len(computed_rewards)}."
+        )
+    for trace_idx, reward in zip(missing_indices, computed_rewards):
+        trace_dataset.set_reward(trace_idx, reward)
+    trace_dataset.finalize_advantages()
+    dist.barrier()
 
 
 class DistributedKRepeatSampler(Sampler):
@@ -1442,6 +1552,8 @@ def main(config):
     )
     offpolicy_positive_only = bool(offpolicy_config.get("positive_only", True))
     offpolicy_use_teacher_logprob = bool(offpolicy_config.get("use_teacher_logprob", True))
+    offpolicy_score_missing_rewards = bool(offpolicy_config.get("score_missing_rewards", True))
+    offpolicy_reward_batch_size = max(1, int(offpolicy_config.get("reward_batch_size", 1)))
     offpolicy_surrogate = offpolicy_config.get("surrogate", "detached_logprob")
     offpolicy_advantage_mode = offpolicy_config.get("advantage_mode", "global")
     offpolicy_train_batch_size = max(1, int(offpolicy_config.get("train_batch_size", offpolicy_config.get("batch_size", train_batch_size))))
@@ -1930,7 +2042,20 @@ def main(config):
             max_steps=offpolicy_max_steps,
             step_stride=offpolicy_step_stride,
             require_teacher_logprob=offpolicy_use_teacher_logprob,
+            allow_missing_reward=offpolicy_score_missing_rewards,
         )
+        if offpolicy_dataset.has_missing_rewards:
+            if not offpolicy_score_missing_rewards:
+                raise ValueError(
+                    "Off-policy traces are missing rewards and "
+                    "rl_config.offpolicy_guidance.score_missing_rewards=False."
+                )
+            fill_missing_trace_rewards(
+                trace_dataset=offpolicy_dataset,
+                reward_fn=reward_fn,
+                batch_size=offpolicy_reward_batch_size,
+                logger=logger,
+            )
         offpolicy_sampler = DistributedSampler(
             offpolicy_dataset,
             num_replicas=dp_size,
@@ -2089,6 +2214,8 @@ def main(config):
     Off-policy step stride: {offpolicy_step_stride}
     Off-policy step weighting: {offpolicy_step_weighting}
     Off-policy use teacher logprob: {offpolicy_use_teacher_logprob}
+    Off-policy score missing rewards: {offpolicy_score_missing_rewards}
+    Off-policy reward batch size: {offpolicy_reward_batch_size}
     Debug training trace: {debug_training}
     Debug trace scope: epochs={debug_training_epochs}, inner_epochs={debug_training_inner_epochs}, micro_batches={debug_training_micro_batches}, timesteps={debug_training_timesteps}, sync={debug_training_sync}, stack_timeout={debug_stack_timeout}s
     Per-prompt stat tracking: {per_prompt_stat_tracking}
