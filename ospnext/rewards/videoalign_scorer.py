@@ -7,6 +7,7 @@ import json
 import argparse
 from typing import List, Union, Optional
 from PIL import Image
+from tqdm import tqdm
 
 class VideoAlignScorer:
     def __init__(
@@ -184,13 +185,136 @@ def process_video_folders(main_dir: str, prompt_file: str, scorer: VideoAlignSco
             print(f"Error processing {subdir_path}: {e}")
 
 
+def _discover_trace_files(trace_dir: str):
+    if not os.path.isdir(trace_dir):
+        raise FileNotFoundError(f"Trace directory not found: {trace_dir}")
+    trace_paths = [
+        os.path.join(trace_dir, name)
+        for name in sorted(os.listdir(trace_dir))
+        if name.endswith((".pt", ".pth"))
+    ]
+    if not trace_paths:
+        raise FileNotFoundError(f"No .pt/.pth trace files found in {trace_dir}")
+    return trace_paths
+
+
+def _has_reward(trace):
+    reward = trace.get("reward", None)
+    if reward is None:
+        return False
+    if isinstance(reward, dict):
+        return reward.get("avg", None) is not None or reward.get("videoalign", None) is not None
+    return True
+
+
+def _atomic_save_trace(trace, trace_path: str):
+    tmp_path = f"{trace_path}.tmp"
+    torch.save(trace, tmp_path)
+    os.replace(tmp_path, trace_path)
+
+
+def _score_trace_video_tensor(scorer: VideoAlignScorer, trace, prompt: str):
+    decoded_video = trace.get("decoded_video", None)
+    if decoded_video is None:
+        raise ValueError(
+            "Trace has no existing decoded_video_path and no decoded_video tensor. "
+            "Regenerate traces with infer_osp.py so decoded_video is saved."
+        )
+    video = torch.as_tensor(decoded_video).cpu()
+    score = scorer(video.unsqueeze(0).numpy(), [prompt])[0]
+    return float(score)
+
+
+def score_trace_files(
+    trace_dir: str,
+    scorer: VideoAlignScorer,
+    batch_size: int = 1,
+    overwrite: bool = False,
+    prefer_video_path: bool = True,
+):
+    """Score denoising trace .pt files and write VideoAlign reward into each trace.
+
+    infer/infer_osp.py saves one sample per .pt file. This function writes:
+        trace["reward"] = {"videoalign": score, "avg": score}
+
+    Existing rewards are preserved unless overwrite=True.
+    """
+    trace_paths = _discover_trace_files(trace_dir)
+    to_score = []
+    skipped = 0
+    for trace_path in tqdm(trace_paths, desc="Scanning traces"):
+        trace = torch.load(trace_path, map_location="cpu")
+        if _has_reward(trace) and not overwrite:
+            skipped += 1
+            continue
+        prompt = trace.get("prompt", None)
+        if not prompt:
+            raise ValueError(f"Trace {trace_path} has no prompt.")
+        decoded_video_path = trace.get("decoded_video_path", None)
+        can_use_video_path = (
+            prefer_video_path
+            and decoded_video_path is not None
+            and os.path.exists(decoded_video_path)
+        )
+        to_score.append({
+            "trace_path": trace_path,
+            "prompt": prompt,
+            "decoded_video_path": decoded_video_path if can_use_video_path else None,
+        })
+
+    print(
+        f"Found {len(trace_paths)} trace files. "
+        f"Need scoring: {len(to_score)}. Skipped existing rewards: {skipped}."
+    )
+    if not to_score:
+        return
+
+    for start in tqdm(range(0, len(to_score), batch_size), desc="Scoring trace rewards"):
+        batch = to_score[start:start + batch_size]
+        path_items = [item for item in batch if item["decoded_video_path"] is not None]
+        tensor_items = [item for item in batch if item["decoded_video_path"] is None]
+
+        scores_by_path = {}
+        if path_items:
+            scores = scorer.score_files(
+                [item["decoded_video_path"] for item in path_items],
+                [item["prompt"] for item in path_items],
+            )
+            for item, score in zip(path_items, scores):
+                scores_by_path[item["trace_path"]] = float(score)
+
+        for item in tensor_items:
+            trace = torch.load(item["trace_path"], map_location="cpu")
+            scores_by_path[item["trace_path"]] = _score_trace_video_tensor(
+                scorer=scorer,
+                trace=trace,
+                prompt=item["prompt"],
+            )
+
+        for item in batch:
+            trace_path = item["trace_path"]
+            trace = torch.load(trace_path, map_location="cpu")
+            score = scores_by_path[trace_path]
+            trace["reward"] = {
+                "videoalign": float(score),
+                "avg": float(score),
+            }
+            _atomic_save_trace(trace, trace_path)
+
+    print(f"Done. Wrote VideoAlign rewards into {len(to_score)} trace files.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process videos and calculate VideoAlign scores.")
     parser.add_argument("--main_dir", type=str, default="/home/ma-user/work/xianyi/osp_next/ospnext/samples/osp_next_mixgrpo/moviegen/lr104_bf16_2", help="Path to the main folder containing subfolders of videos.")
     parser.add_argument("--prompt_file", type=str, default="/home/ma-user/work/xianyi/osp_next/ospnext/assets/t2v/eval_Moviegen.txt", help="Path to the txt file containing prompts.")
+    parser.add_argument("--trace_dir", type=str, default=None, help="Path to infer_osp.py denoising trace .pt files. If set, rewards are written back into each trace.")
     parser.add_argument("--ckpt_path", type=str, default="/home/ma-user/work/xianyi/ckpts/KlingTeam/VideoReward", help="Path to VideoAlign checkpoint.")
     parser.add_argument("--device", type=str, default="npu", help="Device to run on (e.g., cuda, npu).")
     parser.add_argument("--reward_dim", type=str, default="Overall", choices=["VQ", "MQ", "TA", "Overall"], help="Reward dimension.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for VideoAlign scoring.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing rewards in trace .pt files.")
+    parser.add_argument("--no_prefer_video_path", action="store_true", help="Ignore decoded_video_path and score decoded_video tensors from trace files.")
     
     args = parser.parse_args()
 
@@ -200,8 +324,17 @@ if __name__ == "__main__":
         reward_dim=args.reward_dim,
     )
 
-    process_video_folders(
-        main_dir=args.main_dir,
-        prompt_file=args.prompt_file,
-        scorer=scorer
-    )
+    if args.trace_dir is not None:
+        score_trace_files(
+            trace_dir=args.trace_dir,
+            scorer=scorer,
+            batch_size=args.batch_size,
+            overwrite=args.overwrite,
+            prefer_video_path=not args.no_prefer_video_path,
+        )
+    else:
+        process_video_folders(
+            main_dir=args.main_dir,
+            prompt_file=args.prompt_file,
+            scorer=scorer
+        )

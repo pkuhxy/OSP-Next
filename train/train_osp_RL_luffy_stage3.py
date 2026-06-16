@@ -1552,7 +1552,7 @@ def main(config):
     )
     offpolicy_positive_only = bool(offpolicy_config.get("positive_only", True))
     offpolicy_use_teacher_logprob = bool(offpolicy_config.get("use_teacher_logprob", True))
-    offpolicy_score_missing_rewards = bool(offpolicy_config.get("score_missing_rewards", True))
+    offpolicy_score_missing_rewards = bool(offpolicy_config.get("score_missing_rewards", False))
     offpolicy_reward_batch_size = max(1, int(offpolicy_config.get("reward_batch_size", 1)))
     offpolicy_surrogate = offpolicy_config.get("surrogate", "detached_logprob")
     offpolicy_advantage_mode = offpolicy_config.get("advantage_mode", "global")

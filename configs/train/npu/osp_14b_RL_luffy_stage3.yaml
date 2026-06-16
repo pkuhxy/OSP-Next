@@ -118,7 +118,7 @@ rl_config:
     adv_clip_max: 5.0
     positive_only: True
     use_teacher_logprob: True
-    score_missing_rewards: True
+    score_missing_rewards: False
     reward_batch_size: 1
     ratio_clip: 5.0
     surrogate: "detached_logprob"
