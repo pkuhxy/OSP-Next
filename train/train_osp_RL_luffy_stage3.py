@@ -1284,8 +1284,17 @@ def save_lora_checkpoint(model, save_dir, global_step, suffix: str = ""):
         
         print(f"[Rank 0] LoRA checkpoint saved to {save_root} ({len(lora_state_dict)} parameters)")
 
+    dist.barrier()
+
 
 RL_TRAINING_STATE_FILE = "rl_training_state.json"
+
+
+def save_adaptive_grad_clipper_state(adaptive_grad_clipper, save_dir):
+    """Save adaptive grad clipper state once and keep all ranks synchronized."""
+    if dist.get_rank() == 0:
+        adaptive_grad_clipper.save(output_dir=save_dir)
+    dist.barrier()
 
 
 def save_rl_training_state(save_dir, global_step, next_epoch):
@@ -3013,7 +3022,10 @@ def main(config):
                 ema_model.ema_copy_to_model(model)
                 save_lora_checkpoint(model, output_dir, global_step, suffix="-ema")
                 ema_model.restore(model)
-            adaptive_grad_clipper.save(output_dir=_lora_checkpoint_dir(output_dir, global_step))
+            save_adaptive_grad_clipper_state(
+                adaptive_grad_clipper,
+                save_dir=_lora_checkpoint_dir(output_dir, global_step),
+            )
             save_rl_training_state(output_dir, global_step, epoch + 1)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -3123,7 +3135,10 @@ def main(config):
         ema_model.ema_copy_to_model(model)
         save_lora_checkpoint(model, output_dir, global_step, suffix="-ema")
         ema_model.restore(model)
-    adaptive_grad_clipper.save(output_dir=_lora_checkpoint_dir(output_dir, global_step))
+    save_adaptive_grad_clipper_state(
+        adaptive_grad_clipper,
+        save_dir=_lora_checkpoint_dir(output_dir, global_step),
+    )
     save_rl_training_state(output_dir, global_step, completed_epochs)
 
     log_on_main_process(logger, f"""
