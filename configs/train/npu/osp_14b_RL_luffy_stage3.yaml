@@ -114,6 +114,7 @@ rl_config:
     require_base_init: True
     # infer/infer_osp.py saves traces under output_dir/denoising_traces by default.
     trace_dir: "/home/ma-user/work/xianyi/osp_next/dataset/wan14B_offline/denoising_traces"
+    trace_index_path: "/home/ma-user/work/xianyi/osp_next/dataset/wan14B_offline/denoising_traces/trace_index.jsonl"
     loss_weight: 0.01
     adv_clip_max: 5.0
     positive_only: True

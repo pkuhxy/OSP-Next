@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import json
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Union, Optional
 from PIL import Image
 from tqdm import tqdm
@@ -213,6 +214,19 @@ def _atomic_save_trace(trace, trace_path: str):
     os.replace(tmp_path, trace_path)
 
 
+def _trace_manifest_path(trace_dir: str) -> str:
+    return os.path.join(trace_dir, "trace_index.jsonl")
+
+
+def _write_trace_manifest(trace_dir: str, entries):
+    manifest_path = _trace_manifest_path(trace_dir)
+    tmp_path = f"{manifest_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    os.replace(tmp_path, manifest_path)
+
+
 def _score_trace_video_tensor(scorer: VideoAlignScorer, trace, prompt: str):
     decoded_video = trace.get("decoded_video", None)
     if decoded_video is None:
@@ -242,11 +256,9 @@ def score_trace_files(
     trace_paths = _discover_trace_files(trace_dir)
     to_score = []
     skipped = 0
+    manifest_entries = []
     for trace_path in tqdm(trace_paths, desc="Scanning traces"):
         trace = torch.load(trace_path, map_location="cpu")
-        if _has_reward(trace) and not overwrite:
-            skipped += 1
-            continue
         prompt = trace.get("prompt", None)
         if not prompt:
             raise ValueError(f"Trace {trace_path} has no prompt.")
@@ -256,6 +268,17 @@ def score_trace_files(
             and decoded_video_path is not None
             and os.path.exists(decoded_video_path)
         )
+        manifest_entries.append({
+            "trace_path": trace_path,
+            "sample_index": trace.get("sample_index", None),
+            "prompt": prompt,
+            "reward": trace.get("reward", None),
+            "decoded_video_path": decoded_video_path,
+            "teacher_logprob_mode": trace.get("teacher_logprob_mode", None),
+        })
+        if _has_reward(trace) and not overwrite:
+            skipped += 1
+            continue
         to_score.append({
             "trace_path": trace_path,
             "prompt": prompt,
@@ -267,6 +290,8 @@ def score_trace_files(
         f"Need scoring: {len(to_score)}. Skipped existing rewards: {skipped}."
     )
     if not to_score:
+        _write_trace_manifest(trace_dir, manifest_entries)
+        print(f"Saved trace manifest to {_trace_manifest_path(trace_dir)}")
         return
 
     for start in tqdm(range(0, len(to_score), batch_size), desc="Scoring trace rewards"):
@@ -300,8 +325,54 @@ def score_trace_files(
                 "avg": float(score),
             }
             _atomic_save_trace(trace, trace_path)
+            for entry in manifest_entries:
+                if entry["trace_path"] == trace_path:
+                    entry["reward"] = trace["reward"]
+                    break
 
     print(f"Done. Wrote VideoAlign rewards into {len(to_score)} trace files.")
+    _write_trace_manifest(trace_dir, manifest_entries)
+    print(f"Saved trace manifest to {_trace_manifest_path(trace_dir)}")
+
+
+def export_trace_index_from_rewards(trace_dir: str):
+    """Export a lightweight trace_index.jsonl from existing trace rewards.
+
+    This does not run VideoAlign. It only reads reward fields already stored in
+    the trace .pt files.
+    """
+    trace_paths = _discover_trace_files(trace_dir)
+    manifest_entries = []
+    max_workers = min(16, max(1, (os.cpu_count() or 4)))
+
+    def _load_one(trace_path):
+        trace = torch.load(trace_path, map_location="cpu")
+        prompt = trace.get("prompt", None)
+        if not prompt:
+            raise ValueError(f"Trace {trace_path} has no prompt.")
+        reward = trace.get("reward", None)
+        return {
+            "trace_path": trace_path,
+            "sample_index": trace.get("sample_index", None),
+            "prompt": prompt,
+            "reward": None if reward is None else _trace_reward_to_scalar(reward),
+            "decoded_video_path": trace.get("decoded_video_path", None),
+            "teacher_logprob_mode": trace.get("teacher_logprob_mode", None),
+        }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_load_one, trace_path): trace_path
+            for trace_path in trace_paths
+        }
+        results = {}
+        for future in tqdm(as_completed(future_map), total=len(future_map), desc="Exporting trace index"):
+            entry = future.result()
+            results[entry["trace_path"]] = entry
+
+    manifest_entries = [results[trace_path] for trace_path in trace_paths]
+    _write_trace_manifest(trace_dir, manifest_entries)
+    print(f"Saved trace manifest to {_trace_manifest_path(trace_dir)}")
 
 
 if __name__ == "__main__":
@@ -315,16 +386,21 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for VideoAlign scoring.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing rewards in trace .pt files.")
     parser.add_argument("--no_prefer_video_path", action="store_true", help="Ignore decoded_video_path and score decoded_video tensors from trace files.")
+    parser.add_argument("--export_trace_index_only", action="store_true", help="Only export trace_index.jsonl from existing trace rewards without running VideoAlign.")
     
     args = parser.parse_args()
 
-    scorer = VideoAlignScorer(
-        device=args.device,
-        load_from_pretrained=args.ckpt_path,
-        reward_dim=args.reward_dim,
-    )
+    scorer = None
+    if not args.export_trace_index_only:
+        scorer = VideoAlignScorer(
+            device=args.device,
+            load_from_pretrained=args.ckpt_path,
+            reward_dim=args.reward_dim,
+        )
 
-    if args.trace_dir is not None:
+    if args.trace_dir is not None and args.export_trace_index_only:
+        export_trace_index_from_rewards(args.trace_dir)
+    elif args.trace_dir is not None:
         score_trace_files(
             trace_dir=args.trace_dir,
             scorer=scorer,
@@ -333,6 +409,12 @@ if __name__ == "__main__":
             prefer_video_path=not args.no_prefer_video_path,
         )
     else:
+        if scorer is None:
+            scorer = VideoAlignScorer(
+                device=args.device,
+                load_from_pretrained=args.ckpt_path,
+                reward_dim=args.reward_dim,
+            )
         process_video_folders(
             main_dir=args.main_dir,
             prompt_file=args.prompt_file,

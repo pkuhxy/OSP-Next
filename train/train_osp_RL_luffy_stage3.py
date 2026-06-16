@@ -989,6 +989,35 @@ def _discover_trace_paths(trace_dir=None, trace_files=None):
     return paths
 
 
+def _discover_trace_index_path(trace_dir=None, trace_index_path=None):
+    if trace_index_path is not None:
+        if not os.path.exists(trace_index_path):
+            raise FileNotFoundError(f"Trace index file not found: {trace_index_path}")
+        return trace_index_path
+    if trace_dir is None:
+        return None
+    candidate = os.path.join(trace_dir, "trace_index.jsonl")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _load_trace_records_from_index(trace_index_path):
+    records = []
+    with open(trace_index_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if "trace_path" not in record:
+                raise ValueError(f"Trace index entry missing trace_path: {record}")
+            if record.get("reward", None) is not None:
+                record["reward"] = _trace_reward_to_scalar(record["reward"])
+            records.append(record)
+    if not records:
+        raise ValueError(f"No valid trace records found in trace index {trace_index_path}")
+    return records
+
+
 class DenoisingTraceDataset(Dataset):
     """Dataset for traces saved by infer/infer_osp.py.
 
@@ -1002,6 +1031,7 @@ class DenoisingTraceDataset(Dataset):
         text_tokenizer_path,
         trace_dir=None,
         trace_files=None,
+        trace_index_path=None,
         text_max_length=512,
         return_prompt_mask=True,
         advantage_mode="global",
@@ -1011,6 +1041,7 @@ class DenoisingTraceDataset(Dataset):
         allow_missing_reward=False,
     ):
         self.trace_paths = _discover_trace_paths(trace_dir=trace_dir, trace_files=trace_files)
+        self.trace_index_path = trace_index_path
         self.text_processor = WanTextProcessor(
             tokenizer=AutoTokenizer.from_pretrained(text_tokenizer_path),
             model_max_length=text_max_length,
@@ -1021,7 +1052,10 @@ class DenoisingTraceDataset(Dataset):
         self.require_teacher_logprob = require_teacher_logprob
         self.allow_missing_reward = allow_missing_reward
         self.advantage_mode = advantage_mode
-        self.records = self._load_records()
+        if self.trace_index_path is not None:
+            self.records = _load_trace_records_from_index(self.trace_index_path)
+        else:
+            self.records = self._load_records()
         if self.has_missing_rewards:
             if not self.allow_missing_reward:
                 raise ValueError(
@@ -2033,10 +2067,23 @@ def main(config):
     offpolicy_dataloader = None
     offpolicy_sampler = None
     if use_offpolicy_guidance:
-        offpolicy_dataset = DenoisingTraceDataset(
-            text_tokenizer_path=text_tokenizer_path,
+        offpolicy_trace_paths = _discover_trace_paths(
             trace_dir=offpolicy_trace_dir,
             trace_files=offpolicy_trace_files,
+        )
+        offpolicy_trace_index_path = _discover_trace_index_path(
+            trace_dir=offpolicy_trace_dir,
+            trace_index_path=offpolicy_config.get("trace_index_path", None),
+        )
+        log_on_main_process(
+            logger,
+            f"Discovered {len(offpolicy_trace_paths)} off-policy trace files. "
+            f"trace_index={'yes' if offpolicy_trace_index_path is not None else 'no'}",
+        )
+        offpolicy_dataset = DenoisingTraceDataset(
+            text_tokenizer_path=text_tokenizer_path,
+            trace_files=offpolicy_trace_paths,
+            trace_index_path=offpolicy_trace_index_path,
             text_max_length=text_max_length,
             advantage_mode=offpolicy_advantage_mode,
             max_steps=offpolicy_max_steps,
@@ -2044,18 +2091,6 @@ def main(config):
             require_teacher_logprob=offpolicy_use_teacher_logprob,
             allow_missing_reward=offpolicy_score_missing_rewards,
         )
-        if offpolicy_dataset.has_missing_rewards:
-            if not offpolicy_score_missing_rewards:
-                raise ValueError(
-                    "Off-policy traces are missing rewards and "
-                    "rl_config.offpolicy_guidance.score_missing_rewards=False."
-                )
-            fill_missing_trace_rewards(
-                trace_dataset=offpolicy_dataset,
-                reward_fn=reward_fn,
-                batch_size=offpolicy_reward_batch_size,
-                logger=logger,
-            )
         offpolicy_sampler = DistributedSampler(
             offpolicy_dataset,
             num_replicas=dp_size,
