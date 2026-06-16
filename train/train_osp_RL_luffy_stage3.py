@@ -1018,6 +1018,10 @@ def _load_trace_records_from_index(trace_index_path):
     return records
 
 
+def _record_trace_path(record):
+    return record.get("trace_path", record.get("path", None))
+
+
 class DenoisingTraceDataset(Dataset):
     """Dataset for traces saved by infer/infer_osp.py.
 
@@ -1094,11 +1098,12 @@ class DenoisingTraceDataset(Dataset):
         return [idx for idx, record in enumerate(self.records) if record["reward"] is None]
 
     def load_decoded_video_for_reward(self, idx):
-        trace = torch.load(self.records[idx]["path"], map_location="cpu")
+        trace_path = _record_trace_path(self.records[idx])
+        trace = torch.load(trace_path, map_location="cpu")
         decoded_video = trace.get("decoded_video", None)
         if decoded_video is None:
             raise ValueError(
-                f"Trace {self.records[idx]['path']} is missing both reward and decoded_video. "
+                f"Trace {trace_path} is missing both reward and decoded_video. "
                 "Regenerate traces with denoising_trace_config.enabled=True using the current infer_osp.py, "
                 "or save rewards into the trace."
             )
@@ -1158,7 +1163,8 @@ class DenoisingTraceDataset(Dataset):
 
     def __getitem__(self, idx):
         record = self.records[idx]
-        trace = torch.load(record["path"], map_location="cpu")
+        trace_path = _record_trace_path(record)
+        trace = torch.load(trace_path, map_location="cpu")
         prompt = record["prompt"]
         prompt_ids, prompt_mask = self.text_processor(prompt)
         steps = self._select_steps(trace["steps"])
@@ -1175,7 +1181,7 @@ class DenoisingTraceDataset(Dataset):
             if teacher_logprob is None:
                 if self.require_teacher_logprob:
                     raise ValueError(
-                        f"Trace {record['path']} is missing teacher_logprob at step {step['step_index']}. "
+                        f"Trace {trace_path} is missing teacher_logprob at step {step['step_index']}. "
                         "Regenerate traces with denoising_trace_config.save_teacher_logprob=True, "
                         "or set rl_config.offpolicy_guidance.use_teacher_logprob=False."
                     )
@@ -1188,7 +1194,7 @@ class DenoisingTraceDataset(Dataset):
             PROMPT_IDS: prompt_ids,
             PROMPT_MASK: prompt_mask,
             "metadata": {
-                "trace_path": record["path"],
+                "trace_path": trace_path,
                 "sample_index": record["sample_index"],
                 "reward": record["reward"],
             },
@@ -1249,7 +1255,7 @@ def fill_missing_trace_rewards(
                 videos.append(trace_dataset.load_decoded_video_for_reward(trace_idx))
                 prompts.append(trace_dataset.records[trace_idx]["prompt"])
                 metadata.append({
-                    "trace_path": trace_dataset.records[trace_idx]["path"],
+                    "trace_path": _record_trace_path(trace_dataset.records[trace_idx]),
                     "decoded_video_path": trace_dataset.records[trace_idx].get("decoded_video_path"),
                 })
             videos = torch.stack(videos, dim=0).numpy()
