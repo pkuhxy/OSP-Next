@@ -16,7 +16,7 @@ gradient_checkpointing: True
 gradient_accumulation_steps: 1
 init_max_grad_norm: 1.0
 log_interval: 1
-save_interval: 1
+save_interval: 10
 weight_dtype: "bf16"
 ema_decay: 0.999 # 0.999 is used for the 14B model
 ema_update_interval: 1
@@ -126,16 +126,17 @@ rl_config:
     advantage_mode: "global"
     train_batch_size: 1
     every_n_steps: 1
+    max_steps: 1
     step_stride: 1
     # Diffusion denoising usually has larger semantic leverage in early steps.
     # Set to "uniform" for a no-shaping ablation.
     step_weighting: "early"
     step_weight_gamma: 1.0
   debug_training:
-    enable: True
+    enable: False
     epochs: 1
     inner_epochs: 1
     micro_batches: 1
     timesteps: 10
-    sync: True
+    sync: False
     stack_timeout_seconds: 600

@@ -91,17 +91,25 @@ def sde_step_with_logprob(
     if prev_sample is not None:
         prev_sample = prev_sample.to(device=target_device, dtype=model_output.dtype).float()
 
-    sigma = sigmas_schedule[timestep_index]
-    sigma_prev = sigmas_schedule[timestep_index + 1]
-    sigma_max = sigmas_schedule[0].item()
-    sigma_min = sigmas_schedule[-1].item()
+    if sigmas_schedule.dim() == 1:
+        sigma = sigmas_schedule[timestep_index]
+        sigma_prev = sigmas_schedule[timestep_index + 1]
+        sigma_max = sigmas_schedule[0]
+        sigma_min = sigmas_schedule[-1]
+    else:
+        sigma = sigmas_schedule[:, timestep_index]
+        sigma_prev = sigmas_schedule[:, timestep_index + 1]
+        sigma_max = sigmas_schedule[:, 0]
+        sigma_min = sigmas_schedule[:, -1]
 
     dt = sigma_prev - sigma
 
     sigma_b = sigma.view(1, 1, 1, 1, 1) if sigma.dim() == 0 else sigma.view(-1, 1, 1, 1, 1)
     dt_b = dt.view(1, 1, 1, 1, 1) if dt.dim() == 0 else dt.view(-1, 1, 1, 1, 1)
+    sigma_max_b = sigma_max if sigma_max.dim() == 0 else sigma_max.view(-1, 1, 1, 1, 1)
+    sigma_min_b = sigma_min if sigma_min.dim() == 0 else sigma_min.view(-1, 1, 1, 1, 1)
 
-    std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma_b
+    std_dev_t = sigma_min_b + (sigma_max_b - sigma_min_b) * sigma_b
     prev_sample_mean = (
         sample * (1 + std_dev_t ** 2 / (2 * sigma_b) * dt_b)
         + model_output * (1 + std_dev_t ** 2 * (1 - sigma_b) / (2 * sigma_b)) * dt_b
@@ -130,7 +138,7 @@ def sde_step_with_logprob(
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1 * dt_b)) ** 2))
         - torch.log(std_dev_t * torch.sqrt(-1 * dt_b))
-        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        - 0.5 * math.log(2 * math.pi)
     )
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
@@ -444,7 +452,12 @@ def compute_transition_log_prob(
     do_cfg = guidance_scale > 1.0
     target_device = text_embeddings.device
     latents_input = x_t.to(device=target_device, dtype=weight_dtype)
-    t = (sigmas_schedule[step_idx] * 1000.0).expand(latents_input.shape[0]).to(latents_input.device)
+    sigmas_for_model = sigmas_schedule.to(device=target_device)
+    if sigmas_for_model.dim() == 1:
+        sigma_t = sigmas_for_model[step_idx].expand(latents_input.shape[0])
+    else:
+        sigma_t = sigmas_for_model[:, step_idx]
+    t = (sigma_t * 1000.0).to(device=target_device)
 
     noise_pred = model(
         latents_input,
@@ -471,7 +484,7 @@ def compute_transition_log_prob(
         sigmas_schedule,
         noise_pred.float(),
         step_idx,
-        x_t.float(),
+        latents_input.float(),
         num_inference_steps,
         prev_sample=x_t_minus_1.float(),
         return_dt_and_std_dev_t=True,
@@ -493,8 +506,12 @@ def _step_weights_from_indices(step_indices, sigmas_schedule, num_inference_step
         progress = step_indices.float() / denom
         weights = progress.clamp_min(0.0).pow(gamma)
     elif mode == "sigma":
-        flat_indices = step_indices.long().clamp(0, len(sigmas_schedule) - 1)
-        weights = sigmas_schedule[flat_indices].float().to(step_indices.device).pow(gamma)
+        flat_indices = step_indices.long().clamp(0, sigmas_schedule.shape[-1] - 1)
+        sigmas_for_weight = sigmas_schedule.to(step_indices.device)
+        if sigmas_for_weight.dim() == 1:
+            weights = sigmas_for_weight[flat_indices].float().pow(gamma)
+        else:
+            weights = sigmas_for_weight.gather(1, flat_indices.view(-1, 1)).squeeze(1).float().pow(gamma)
     else:
         raise ValueError(
             "rl_config.offpolicy_guidance.step_weighting must be one of "
@@ -526,6 +543,7 @@ def compute_offpolicy_guidance_loss(
     trace_next_latents = trace_batch["trace_next_latents"]
     trace_step_indices = trace_batch["trace_step_indices"].long()
     trace_advantages = trace_batch["trace_advantages"].float()
+    trace_sigmas = trace_batch.get("trace_sigmas", None)
 
     bsz, num_steps = trace_step_indices.shape
     flat_x_t = trace_latents.reshape(bsz * num_steps, *trace_latents.shape[2:])
@@ -536,8 +554,18 @@ def compute_offpolicy_guidance_loss(
         .expand(bsz, num_steps, *text_embeddings.shape[1:])
         .reshape(bsz * num_steps, *text_embeddings.shape[1:])
     )
+    flat_sigmas_schedule = None
+    if trace_sigmas is not None:
+        trace_sigmas = trace_sigmas.float()
+        flat_sigmas_schedule = (
+            trace_sigmas[:, None, :]
+            .expand(bsz, num_steps, trace_sigmas.shape[-1])
+            .reshape(bsz * num_steps, trace_sigmas.shape[-1])
+        )
 
     valid = (flat_step_indices >= 0) & (flat_step_indices < num_inference_steps)
+    if flat_sigmas_schedule is not None:
+        valid = valid & (flat_step_indices + 1 < flat_sigmas_schedule.shape[-1])
     if not valid.any():
         zero = text_embeddings.sum() * 0.0
         return loss_weight * zero, {
@@ -558,6 +586,11 @@ def compute_offpolicy_guidance_loss(
         neg_embeds = None
         if negative_text_embeddings is not None:
             neg_embeds = negative_text_embeddings.expand(step_positions.numel(), -1, -1)
+        step_sigmas_schedule = (
+            flat_sigmas_schedule[step_positions]
+            if flat_sigmas_schedule is not None
+            else sigmas_schedule
+        )
         log_prob, _, _, _ = compute_transition_log_prob(
             model=model,
             x_t=flat_x_t[step_positions],
@@ -565,7 +598,7 @@ def compute_offpolicy_guidance_loss(
             step_idx=step_idx,
             text_embeddings=flat_text_embeddings[step_positions],
             weight_dtype=weight_dtype,
-            sigmas_schedule=sigmas_schedule,
+            sigmas_schedule=step_sigmas_schedule,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             negative_text_embeddings=neg_embeds,
@@ -578,14 +611,13 @@ def compute_offpolicy_guidance_loss(
     selected_positions = torch.cat(position_chunks, dim=0)
     flat_log_probs = torch.cat(log_prob_chunks, dim=0)
     flat_step_indices = flat_step_indices[selected_positions]
-    valid = torch.ones_like(flat_step_indices, dtype=torch.bool)
+    valid = torch.ones_like(flat_log_probs, dtype=torch.bool, device=flat_log_probs.device)
 
     flat_advantages = (
         trace_advantages[:, None]
         .expand(bsz, num_steps)
         .reshape(-1)
-        .to(device=flat_log_probs.device, dtype=torch.float32)
-    )[selected_positions]
+    )[selected_positions].to(device=flat_log_probs.device, dtype=torch.float32)
     flat_advantages = torch.clamp(flat_advantages, -adv_clip_max, adv_clip_max)
     if positive_only:
         active = valid & (flat_advantages > 0)
@@ -605,10 +637,10 @@ def compute_offpolicy_guidance_loss(
         }
 
     if use_teacher_logprob:
-        flat_teacher_log_probs = trace_batch["trace_teacher_logprobs"].reshape(-1).to(
+        flat_teacher_log_probs = trace_batch["trace_teacher_logprobs"].reshape(-1)[selected_positions].to(
             device=flat_log_probs.device,
             dtype=torch.float32,
-        )[selected_positions]
+        )
         finite_teacher = torch.isfinite(flat_teacher_log_probs)
         active = active & finite_teacher
         log_ratio = flat_log_probs - flat_teacher_log_probs
@@ -629,13 +661,18 @@ def compute_offpolicy_guidance_loss(
             "offpolicy/logprob_mean": float(flat_log_probs[valid].mean().detach().cpu()),
         }
 
+    step_weight_sigmas = (
+        flat_sigmas_schedule[selected_positions]
+        if flat_sigmas_schedule is not None
+        else sigmas_schedule
+    )
     step_weights = _step_weights_from_indices(
-        flat_step_indices,
-        sigmas_schedule=sigmas_schedule,
+        flat_step_indices.to(flat_log_probs.device),
+        sigmas_schedule=step_weight_sigmas.to(flat_log_probs.device),
         num_inference_steps=num_inference_steps,
         mode=step_weighting,
         gamma=step_weight_gamma,
-    ).to(flat_log_probs.device)
+    )
 
     surrogate = (surrogate or "detached_logprob").lower()
     if surrogate == "ratio":
@@ -1005,6 +1042,7 @@ def _discover_trace_index_path(trace_dir=None, trace_index_path=None):
 
 def _load_trace_records_from_index(trace_index_path):
     records = []
+    index_dir = os.path.dirname(os.path.abspath(trace_index_path))
     with open(trace_index_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1013,6 +1051,10 @@ def _load_trace_records_from_index(trace_index_path):
             record = json.loads(line)
             if "trace_path" not in record:
                 raise ValueError(f"Trace index entry missing trace_path: {record}")
+            trace_path = record["trace_path"]
+            if not os.path.isabs(trace_path):
+                trace_path = os.path.join(index_dir, trace_path)
+            record["trace_path"] = os.path.abspath(trace_path)
             if record.get("reward", None) is not None:
                 record["reward"] = _trace_reward_to_scalar(record["reward"])
             records.append(record)
@@ -1023,6 +1065,13 @@ def _load_trace_records_from_index(trace_index_path):
 
 def _record_trace_path(record):
     return record.get("trace_path", record.get("path", None))
+
+
+def _load_trace_file(trace_path):
+    try:
+        return torch.load(trace_path, map_location="cpu", mmap=True)
+    except (TypeError, ValueError, RuntimeError):
+        return torch.load(trace_path, map_location="cpu")
 
 
 class DenoisingTraceDataset(Dataset):
@@ -1047,8 +1096,11 @@ class DenoisingTraceDataset(Dataset):
         require_teacher_logprob=True,
         allow_missing_reward=False,
     ):
-        self.trace_paths = _discover_trace_paths(trace_dir=trace_dir, trace_files=trace_files)
         self.trace_index_path = trace_index_path
+        self.trace_paths = [] if self.trace_index_path is not None else _discover_trace_paths(
+            trace_dir=trace_dir,
+            trace_files=trace_files,
+        )
         self.text_processor = WanTextProcessor(
             tokenizer=AutoTokenizer.from_pretrained(text_tokenizer_path),
             model_max_length=text_max_length,
@@ -1077,7 +1129,7 @@ class DenoisingTraceDataset(Dataset):
     def _load_records(self):
         records = []
         for trace_path in self.trace_paths:
-            trace = torch.load(trace_path, map_location="cpu")
+            trace = _load_trace_file(trace_path)
             prompt = trace.get("prompt", "")
             if not prompt:
                 raise ValueError(f"Trace {trace_path} does not contain a non-empty prompt.")
@@ -1095,14 +1147,14 @@ class DenoisingTraceDataset(Dataset):
 
     @property
     def has_missing_rewards(self):
-        return any(record["reward"] is None for record in self.records)
+        return any(record.get("reward", None) is None for record in self.records)
 
     def missing_reward_indices(self):
-        return [idx for idx, record in enumerate(self.records) if record["reward"] is None]
+        return [idx for idx, record in enumerate(self.records) if record.get("reward", None) is None]
 
     def load_decoded_video_for_reward(self, idx):
         trace_path = _record_trace_path(self.records[idx])
-        trace = torch.load(trace_path, map_location="cpu")
+        trace = _load_trace_file(trace_path)
         decoded_video = trace.get("decoded_video", None)
         if decoded_video is None:
             raise ValueError(
@@ -1167,10 +1219,16 @@ class DenoisingTraceDataset(Dataset):
     def __getitem__(self, idx):
         record = self.records[idx]
         trace_path = _record_trace_path(record)
-        trace = torch.load(trace_path, map_location="cpu")
+        trace = _load_trace_file(trace_path)
         prompt = record["prompt"]
         prompt_ids, prompt_mask = self.text_processor(prompt)
         steps = self._select_steps(trace["steps"])
+        trace_sigmas_value = trace.get("sigmas", None)
+        if trace_sigmas_value is None:
+            raise ValueError(f"Trace {trace_path} does not contain sigmas.")
+        trace_sigmas = torch.as_tensor(trace_sigmas_value, dtype=torch.float32)
+        if trace_sigmas.ndim != 1 or trace_sigmas.numel() < 2:
+            raise ValueError(f"Trace {trace_path} has invalid sigmas: shape={tuple(trace_sigmas.shape)}")
 
         latents = []
         next_latents = []
@@ -1198,14 +1256,15 @@ class DenoisingTraceDataset(Dataset):
             PROMPT_MASK: prompt_mask,
             "metadata": {
                 "trace_path": trace_path,
-                "sample_index": record["sample_index"],
-                "reward": record["reward"],
+                "sample_index": record.get("sample_index", idx),
+                "reward": record.get("reward", None),
             },
             "trace_latents": torch.stack(latents, dim=0),
             "trace_next_latents": torch.stack(next_latents, dim=0),
             "trace_step_indices": torch.as_tensor(step_indices, dtype=torch.long),
             "trace_teacher_logprobs": torch.stack(teacher_logprobs, dim=0),
             "trace_advantage": torch.tensor(record["advantage"], dtype=torch.float32),
+            "trace_sigmas": trace_sigmas,
         }
 
     @staticmethod
@@ -1226,6 +1285,7 @@ class DenoisingTraceDataset(Dataset):
                 [example["trace_teacher_logprobs"] for example in examples], dim=0
             ),
             "trace_advantages": torch.stack([example["trace_advantage"] for example in examples], dim=0),
+            "trace_sigmas": torch.stack([example["trace_sigmas"] for example in examples], dim=0),
         }
 
 
@@ -2076,17 +2136,19 @@ def main(config):
     offpolicy_dataloader = None
     offpolicy_sampler = None
     if use_offpolicy_guidance:
-        offpolicy_trace_paths = _discover_trace_paths(
-            trace_dir=offpolicy_trace_dir,
-            trace_files=offpolicy_trace_files,
-        )
         offpolicy_trace_index_path = _discover_trace_index_path(
             trace_dir=offpolicy_trace_dir,
             trace_index_path=offpolicy_config.get("trace_index_path", None),
         )
+        offpolicy_trace_paths = None
+        if offpolicy_trace_index_path is None:
+            offpolicy_trace_paths = _discover_trace_paths(
+                trace_dir=offpolicy_trace_dir,
+                trace_files=offpolicy_trace_files,
+            )
         log_on_main_process(
             logger,
-            f"Discovered {len(offpolicy_trace_paths)} off-policy trace files. "
+            f"Discovered {len(offpolicy_trace_paths) if offpolicy_trace_paths is not None else 'index-backed'} off-policy trace files. "
             f"trace_index={'yes' if offpolicy_trace_index_path is not None else 'no'}",
         )
         offpolicy_dataset = DenoisingTraceDataset(
@@ -2451,10 +2513,10 @@ def main(config):
                     "prompt_embeds": text_embeddings.detach().cpu(),
                     "neg_prompt_embeds": neg_text_embeddings.expand(sample_batch_size, -1, -1).detach().cpu(),
                     "timesteps": timesteps_repeated.cpu(),
-                    "latents": latents_stacked[:, :-1].detach(),
-                    "next_latents": latents_stacked[:, 1:].detach(),
-                    "log_probs": log_probs_stacked.detach(),
-                    "kl": kl_stacked.detach(),
+                    "latents": latents_stacked[:, :-1].detach().cpu(),
+                    "next_latents": latents_stacked[:, 1:].detach().cpu(),
+                    "log_probs": log_probs_stacked.detach().cpu(),
+                    "kl": kl_stacked.detach().cpu(),
                     "rewards": rewards_future,
                 })
                 del latents_stacked, log_probs_stacked, kl_stacked, videos_cpu
