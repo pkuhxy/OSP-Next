@@ -440,7 +440,8 @@ def compute_transition_log_prob(
     sp_group=None,
 ):
     do_cfg = guidance_scale > 1.0
-    latents_input = x_t.to(weight_dtype)
+    target_device = text_embeddings.device
+    latents_input = x_t.to(device=target_device, dtype=weight_dtype)
     t = (sigmas_schedule[step_idx] * 1000.0).expand(latents_input.shape[0]).to(latents_input.device)
 
     noise_pred = model(
@@ -536,7 +537,7 @@ def compute_offpolicy_guidance_loss(
 
     valid = (flat_step_indices >= 0) & (flat_step_indices < num_inference_steps)
     if not valid.any():
-        zero = flat_x_t.sum() * 0.0
+        zero = text_embeddings.sum() * 0.0
         return loss_weight * zero, {
             "offpolicy/loss_raw": 0.0,
             "offpolicy/loss_weighted": 0.0,
@@ -3016,15 +3017,11 @@ def main(config):
                         )
                         debug_train_log("offpolicy_encode_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
 
-                        offpolicy_micro_batch = {
-                            key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
-                            for key, value in offpolicy_cpu_batch.items()
-                        }
                         debug_train_log("offpolicy_forward_before", epoch, inner_epoch, mb_idx, j)
                         with torch.autocast("cuda", dtype=weight_dtype):
                             offpolicy_loss, offpolicy_metrics = compute_offpolicy_guidance_loss(
                                 model=model,
-                                trace_batch=offpolicy_micro_batch,
+                                trace_batch=offpolicy_cpu_batch,
                                 text_embeddings=offpolicy_text_embeddings,
                                 weight_dtype=weight_dtype,
                                 sigmas_schedule=sigmas_schedule,
@@ -3063,7 +3060,7 @@ def main(config):
                             offpolicy_loss.backward()
                             debug_train_log("offpolicy_backward_after", epoch, inner_epoch, mb_idx, j, sync=debug_training_sync)
                             total_loss_for_log = total_loss_for_log + offpolicy_loss.detach()
-                        del offpolicy_cpu_batch, offpolicy_micro_batch, offpolicy_text_embeddings, offpolicy_loss
+                        del offpolicy_cpu_batch, offpolicy_text_embeddings, offpolicy_loss
 
                     info["loss"].append(total_loss_for_log)
 
