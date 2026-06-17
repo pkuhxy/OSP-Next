@@ -85,9 +85,11 @@ def sde_step_with_logprob(
     sp_group=None,
 ):
     model_output = model_output.float()
-    sample = sample.float()
+    target_device = model_output.device
+    sample = sample.to(device=target_device, dtype=model_output.dtype).float()
+    sigmas_schedule = sigmas_schedule.to(device=target_device, dtype=model_output.dtype)
     if prev_sample is not None:
-        prev_sample = prev_sample.float()
+        prev_sample = prev_sample.to(device=target_device, dtype=model_output.dtype).float()
 
     sigma = sigmas_schedule[timestep_index]
     sigma_prev = sigmas_schedule[timestep_index + 1]
